@@ -50,6 +50,14 @@ function normalizeFilters(filters?: FilterInput): Filter[] | undefined {
   return Object.entries(filters).map(([field, value]) => [field, "=", value]);
 }
 
+function normalizeBaseUrl(value: string): string {
+  const url = new URL(value);
+  if (url.pathname === "/desk" || url.pathname === "/desk/") {
+    url.pathname = "/";
+  }
+  return url.toString().replace(/\/$/, "");
+}
+
 function requiredString(
   args: { [key: string]: unknown } | undefined,
   name: string
@@ -108,8 +116,11 @@ class ERPNextClient {
       throw new Error("ERPNEXT_URL environment variable is required");
     }
     
-    // Remove trailing slash if present
-    this.baseUrl = this.baseUrl.replace(/\/$/, '');
+    try {
+      this.baseUrl = normalizeBaseUrl(this.baseUrl);
+    } catch {
+      throw new Error("ERPNEXT_URL must be a valid absolute URL");
+    }
     
     const configuredTimeout = Number(process.env.ERPNEXT_TIMEOUT_MS || 15000);
     if (!Number.isInteger(configuredTimeout) || configuredTimeout <= 0) {
@@ -163,13 +174,21 @@ class ERPNextClient {
     return error.message;
   }
 
+  private responseData(response: { data?: { data?: unknown } }, operation: string): unknown {
+    const data = response.data?.data;
+    if (data === undefined) {
+      throw new Error(`ERPNext returned an invalid response for ${operation}`);
+    }
+    return data;
+  }
+
   // Get a document by doctype and name
   async getDocument(doctype: string, name: string): Promise<any> {
     try {
       const response = await this.axiosInstance.get(
         `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`
       );
-      return response.data.data;
+      return this.responseData(response, `get ${doctype} ${name}`);
     } catch (error: unknown) {
       throw new Error(`Failed to get ${doctype} ${name}: ${this.formatError(error)}`);
     }
@@ -200,7 +219,7 @@ class ERPNextClient {
         `/api/resource/${encodeURIComponent(doctype)}`,
         { params }
       );
-      return response.data.data;
+      return this.responseData(response, `list ${doctype}`) as unknown[];
     } catch (error: unknown) {
       throw new Error(`Failed to get ${doctype} list: ${this.formatError(error)}`);
     }
@@ -213,7 +232,7 @@ class ERPNextClient {
         `/api/resource/${encodeURIComponent(doctype)}`,
         doc
       );
-      return response.data.data;
+      return this.responseData(response, `create ${doctype}`);
     } catch (error: unknown) {
       throw new Error(`Failed to create ${doctype}: ${this.formatError(error)}`);
     }
@@ -226,7 +245,7 @@ class ERPNextClient {
         `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`,
         doc
       );
-      return response.data.data;
+      return this.responseData(response, `update ${doctype} ${name}`);
     } catch (error: unknown) {
       throw new Error(`Failed to update ${doctype} ${name}: ${this.formatError(error)}`);
     }
@@ -242,16 +261,19 @@ class ERPNextClient {
       const response = await this.axiosInstance.get(
         `/api/v2/doctype/${encodeURIComponent(doctype)}/meta`
       );
-      const metadata = response.data.data ?? response.data.message ?? response.data;
-      doctypeCache.set(cacheKey, metadata);
-      return metadata;
+        const metadata = response.data.data;
+        if (!metadata || typeof metadata !== "object") {
+          throw new Error(`ERPNext returned invalid metadata for ${doctype}`);
+        }
+        doctypeCache.set(cacheKey, metadata);
+        return metadata;
     } catch (error: unknown) {
       // Fallback keeps compatibility with older Frappe installations.
       try {
         const response = await this.axiosInstance.get(
           `/api/resource/DocType/${encodeURIComponent(doctype)}`
         );
-        const metadata = response.data.data;
+        const metadata = this.responseData(response, `metadata for ${doctype}`);
         doctypeCache.set(cacheKey, metadata);
         return metadata;
       } catch (fallbackError: unknown) {
