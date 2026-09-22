@@ -764,6 +764,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     "cancel_document",
     "delete_document"
   ]);
+  const structuredTools = new Set([
+    "get_doctypes",
+    "get_doctype_fields",
+    "get_documents",
+    "run_report",
+    "get_document"
+  ]);
 
   return {
     tools: tools.map(tool => ({
@@ -774,11 +781,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         idempotentHint: readOnlyTools.has(tool.name) || tool.name === "update_document" || tool.name === "cancel_document",
         openWorldHint: true
       },
-      outputSchema: {
-        type: "object",
-        properties: { data: {} },
-        required: ["data"]
-      }
+      ...(structuredTools.has(tool.name) ? {
+        outputSchema: {
+          type: "object",
+          properties: { data: {} },
+          required: ["data"]
+        }
+      } : {})
     }))
   };
 });
