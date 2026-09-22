@@ -50,6 +50,47 @@ function normalizeFilters(filters?: FilterInput): Filter[] | undefined {
   return Object.entries(filters).map(([field, value]) => [field, "=", value]);
 }
 
+function requiredString(
+  args: { [key: string]: unknown } | undefined,
+  name: string
+): string {
+  const value = args?.[name];
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new McpError(ErrorCode.InvalidParams, `${name} is required`);
+  }
+  return value.trim();
+}
+
+function parseFilterInput(value: unknown): FilterInput | undefined {
+  if (value === undefined) return undefined;
+  if (Array.isArray(value)) {
+    for (const filter of value) {
+      if (!Array.isArray(filter) || filter.length !== 3 || typeof filter[0] !== "string") {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Filters must use [field, operator, value] tuples"
+        );
+      }
+    }
+    return value as Filter[];
+  }
+  if (typeof value === "object" && value !== null && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  throw new McpError(ErrorCode.InvalidParams, "Filters must be an array or object");
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function jsonResult(value: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
+    structuredContent: { data: value }
+  };
+}
+
 // ERPNext API client configuration
 class ERPNextClient {
   private baseUrl: string;
@@ -436,8 +477,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
  * Handler that lists available tools.
  */
 server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
-    tools: [
+  const tools = [
       {
         name: "get_doctypes",
         description: "Get a list of all available DocTypes",
@@ -478,9 +518,41 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "Fields to include (optional)"
             },
             filters: {
-              type: "object",
-              additionalProperties: true,
-              description: "Filters in the format {field: value} (optional)"
+              oneOf: [
+                {
+                  type: "array",
+                  items: {
+                    type: "array",
+                    minItems: 3,
+                    maxItems: 3,
+                    items: {}
+                  }
+                },
+                {
+                  type: "object",
+                  additionalProperties: true
+                }
+              ],
+              description: "Frappe filters as [field, operator, value] tuples; simple {field: value} objects are also accepted."
+            },
+            or_filters: {
+              type: "array",
+              description: "Optional OR filters as [field, operator, value] tuples.",
+              items: { type: "array", minItems: 3, maxItems: 3, items: {} }
+            },
+            limit_start: {
+              type: "integer",
+              minimum: 0,
+              description: "Number of records to skip (optional)"
+            },
+            order_by: {
+              type: "string",
+              description: "Sort expression, for example modified desc (optional)"
+            },
+            expand: {
+              type: "array",
+              items: { type: "string" },
+              description: "Link fields to expand (optional)"
             },
             limit: {
               type: "number",
@@ -663,7 +735,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["doctype", "name"]
         }
       }
-    ]
+  ];
+
+  const readOnlyTools = new Set([
+    "get_doctypes",
+    "get_doctype_fields",
+    "get_documents",
+    "run_report",
+    "get_document"
+  ]);
+  const destructiveTools = new Set(["cancel_document", "delete_document"]);
+
+  return {
+    tools: tools.map(tool => ({
+      ...tool,
+      annotations: {
+        readOnlyHint: readOnlyTools.has(tool.name),
+        destructiveHint: destructiveTools.has(tool.name),
+        idempotentHint: readOnlyTools.has(tool.name) || tool.name === "update_document" || tool.name === "cancel_document",
+        openWorldHint: true
+      },
+      outputSchema: {
+        type: "object",
+        properties: { data: {} },
+        required: ["data"]
+      }
+    }))
   };
 });
 
@@ -683,30 +780,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
   switch (request.params.name) {
     case "get_documents": {
-      const doctype = String(request.params.arguments?.doctype);
+      const doctype = requiredString(request.params.arguments, "doctype");
       const fields = request.params.arguments?.fields as string[] | undefined;
-      const filters = request.params.arguments?.filters as Record<string, any> | undefined;
+      const filters = parseFilterInput(request.params.arguments?.filters);
+      const orFilters = parseFilterInput(request.params.arguments?.or_filters);
       const limit = request.params.arguments?.limit as number | undefined;
-      
-      if (!doctype) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Doctype is required"
-        );
-      }
+      const limitStart = request.params.arguments?.limit_start as number | undefined;
+      const orderBy = request.params.arguments?.order_by as string | undefined;
+      const expand = request.params.arguments?.expand as string[] | undefined;
       
       try {
         const documents = await erpnext.getDocList(doctype, {
           filters,
+          orFilters,
           fields,
-          limit
+          limit,
+          limitStart,
+          orderBy,
+          expand
         });
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(documents, null, 2)
-          }]
-        };
+        return jsonResult(documents);
       } catch (error: any) {
         return {
           content: [{
@@ -719,11 +812,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "create_document": {
-      const doctype = String(request.params.arguments?.doctype);
+      const doctype = requiredString(request.params.arguments, "doctype");
       const data = request.params.arguments?.data as Record<string, any> | undefined;
       const verbose = request.params.arguments?.verbose === true;
       
-      if (!doctype || !data) {
+      if (!isRecord(data)) {
         throw new McpError(
           ErrorCode.InvalidParams,
           "Doctype and data are required"
@@ -757,12 +850,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "update_document": {
-      const doctype = String(request.params.arguments?.doctype);
-      const name = String(request.params.arguments?.name);
+      const doctype = requiredString(request.params.arguments, "doctype");
+      const name = requiredString(request.params.arguments, "name");
       const data = request.params.arguments?.data as Record<string, any> | undefined;
       const verbose = request.params.arguments?.verbose === true;
       
-      if (!doctype || !name || !data) {
+      if (!isRecord(data)) {
         throw new McpError(
           ErrorCode.InvalidParams,
           "Doctype, name, and data are required"
@@ -796,24 +889,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "run_report": {
-      const reportName = String(request.params.arguments?.report_name);
+      const reportName = requiredString(request.params.arguments, "report_name");
       const filters = request.params.arguments?.filters as Record<string, any> | undefined;
-      
-      if (!reportName) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Report name is required"
-        );
-      }
       
       try {
         const result = await erpnext.runReport(reportName, filters);
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(result, null, 2)
-          }]
-        };
+        return jsonResult(result);
       } catch (error: any) {
         return {
           content: [{
@@ -826,24 +907,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "get_document": {
-      const doctype = String(request.params.arguments?.doctype);
-      const name = String(request.params.arguments?.name);
-      
-      if (!doctype || !name) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Doctype and name are required"
-        );
-      }
+      const doctype = requiredString(request.params.arguments, "doctype");
+      const name = requiredString(request.params.arguments, "name");
       
       try {
         const document = await erpnext.getDocument(doctype, name);
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(document, null, 2)
-          }]
-        };
+        return jsonResult(document);
       } catch (error: any) {
         return {
           content: [{
@@ -856,16 +925,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "call_method": {
-      const method = String(request.params.arguments?.method);
+      const method = requiredString(request.params.arguments, "method");
       const args = request.params.arguments?.args as Record<string, any> | undefined;
       const httpMethod = (request.params.arguments?.http_method as "GET" | "POST") || "POST";
-      
-      if (!method) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Method is required"
-        );
-      }
       
       try {
         const result = await erpnext.callMethod(method, args, httpMethod);
@@ -887,16 +949,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "submit_document": {
-      const doctype = String(request.params.arguments?.doctype);
-      const name = String(request.params.arguments?.name);
+      const doctype = requiredString(request.params.arguments, "doctype");
+      const name = requiredString(request.params.arguments, "name");
       const verbose = request.params.arguments?.verbose === true;
-      
-      if (!doctype || !name) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Doctype and name are required"
-        );
-      }
       
       try {
         // frappe.client.submit constructs the doc from the passed dict rather
@@ -934,16 +989,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "cancel_document": {
-      const doctype = String(request.params.arguments?.doctype);
-      const name = String(request.params.arguments?.name);
+      const doctype = requiredString(request.params.arguments, "doctype");
+      const name = requiredString(request.params.arguments, "name");
       const verbose = request.params.arguments?.verbose === true;
-      
-      if (!doctype || !name) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Doctype and name are required"
-        );
-      }
       
       try {
         const result = await erpnext.callMethod('frappe.client.cancel', { doctype, name });
@@ -978,16 +1026,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "delete_document": {
-      const doctype = String(request.params.arguments?.doctype);
-      const name = String(request.params.arguments?.name);
-      
-      if (!doctype || !name) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Doctype and name are required"
-        );
-      }
-      
+      const doctype = requiredString(request.params.arguments, "doctype");
+      const name = requiredString(request.params.arguments, "name");
+
       try {
         await erpnext.deleteDocument(doctype, name);
         return {
@@ -1010,23 +1051,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     
     case "get_doctype_fields": {
-      const doctype = String(request.params.arguments?.doctype);
-      
-      if (!doctype) {
-        throw new McpError(
-          ErrorCode.InvalidParams,
-          "Doctype is required"
-        );
-      }
+      const doctype = requiredString(request.params.arguments, "doctype");
       
       try {
         const metadata = await erpnext.getDocTypeMeta(doctype);
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(metadata, null, 2)
-          }]
-        };
+        return jsonResult(metadata);
       } catch (error: any) {
         return {
           content: [{
@@ -1041,12 +1070,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "get_doctypes": {
       try {
         const doctypes = await erpnext.getAllDocTypes();
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(doctypes, null, 2)
-          }]
-        };
+        return jsonResult(doctypes);
       } catch (error: any) {
         return {
           content: [{
