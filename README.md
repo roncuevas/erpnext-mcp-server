@@ -29,6 +29,11 @@ The server requires the following environment variables:
 - `ERPNEXT_URL` - The base URL of your ERPNext instance
 - `ERPNEXT_API_KEY` (optional) - API key for authentication
 - `ERPNEXT_API_SECRET` (optional) - API secret for authentication
+- `ERPNEXT_ACCESS_TOKEN` (optional) - OAuth Bearer token; takes precedence over API key/secret
+- `ERPNEXT_TIMEOUT_MS` (optional) - HTTP timeout in milliseconds; defaults to `15000`
+
+Use either `ERPNEXT_ACCESS_TOKEN` or the `ERPNEXT_API_KEY`/`ERPNEXT_API_SECRET`
+pair. Do not commit credentials to the repository.
 
 ## Development
 
@@ -99,6 +104,33 @@ The Inspector will provide a URL to access debugging tools in your browser.
 </arguments>
 </use_mcp_tool>
 ```
+
+### List documents with filters
+
+`get_documents` accepts Frappe's canonical filter tuples and pagination options:
+
+```json
+{
+  "doctype": "Customer",
+  "fields": ["name", "customer_name", "territory"],
+  "filters": [["disabled", "=", 0]],
+  "limit": 25,
+  "limit_start": 0,
+  "order_by": "modified desc"
+}
+```
+
+Simple `{ "field": "value" }` filters remain accepted for compatibility and
+are normalized to equality filters.
+
+`get_doctype_fields` uses Frappe's metadata endpoint when available, so it can
+return fields even when the DocType has no documents. It falls back to the
+legacy `DocType` resource endpoint for older Frappe installations.
+
+The destructive tools (`cancel_document` and `delete_document`) are annotated
+for MCP clients, but authorization must still be enforced by ERPNext. The
+generic `call_method` tool should only be exposed to trusted clients because
+it can invoke any whitelisted Frappe method.
 
 ### Get Customer Details
 ```
