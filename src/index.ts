@@ -23,11 +23,39 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
 
+type FilterOperator = "=" | "!=" | "<" | "<=" | ">" | ">=" | "like" | "not like" | "in" | "not in" | "is" | "between";
+type Filter = [field: string, operator: FilterOperator, value: unknown];
+type FilterInput = Filter[] | Record<string, unknown>;
+
+interface DocListOptions {
+  fields?: string[];
+  filters?: FilterInput;
+  orFilters?: FilterInput;
+  limit?: number;
+  limitStart?: number;
+  orderBy?: string;
+  expand?: string[];
+}
+
+interface ERPNextErrorPayload {
+  exc_type?: string;
+  exception?: string;
+  exc?: string;
+  message?: string;
+}
+
+function normalizeFilters(filters?: FilterInput): Filter[] | undefined {
+  if (!filters) return undefined;
+  if (Array.isArray(filters)) return filters;
+  return Object.entries(filters).map(([field, value]) => [field, "=", value]);
+}
+
 // ERPNext API client configuration
 class ERPNextClient {
   private baseUrl: string;
   private axiosInstance: AxiosInstance;
   private authenticated: boolean = false;
+  private readonly timeoutMs: number;
 
   constructor() {
     // Get ERPNext configuration from environment variables
@@ -41,10 +69,16 @@ class ERPNextClient {
     // Remove trailing slash if present
     this.baseUrl = this.baseUrl.replace(/\/$/, '');
     
+    const configuredTimeout = Number(process.env.ERPNEXT_TIMEOUT_MS || 15000);
+    if (!Number.isInteger(configuredTimeout) || configuredTimeout <= 0) {
+      throw new Error("ERPNEXT_TIMEOUT_MS must be a positive integer");
+    }
+    this.timeoutMs = configuredTimeout;
+
     // Initialize axios instance
     this.axiosInstance = axios.create({
       baseURL: this.baseUrl,
-      withCredentials: true,
+      timeout: this.timeoutMs,
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
@@ -54,8 +88,12 @@ class ERPNextClient {
     // Configure authentication if credentials provided
     const apiKey = process.env.ERPNEXT_API_KEY;
     const apiSecret = process.env.ERPNEXT_API_SECRET;
+    const accessToken = process.env.ERPNEXT_ACCESS_TOKEN;
     
-    if (apiKey && apiSecret) {
+    if (accessToken) {
+      this.axiosInstance.defaults.headers.common['Authorization'] = `Bearer ${accessToken}`;
+      this.authenticated = true;
+    } else if (apiKey && apiSecret) {
       this.axiosInstance.defaults.headers.common['Authorization'] = 
         `token ${apiKey}:${apiSecret}`;
       this.authenticated = true;
@@ -66,6 +104,17 @@ class ERPNextClient {
     return this.authenticated;
   }
 
+  private formatError(error: unknown): string {
+    if (!axios.isAxiosError(error)) {
+      return error instanceof Error ? error.message : "Unknown error";
+    }
+
+    const payload = error.response?.data as ERPNextErrorPayload | undefined;
+    const details = payload?.exception || payload?.exc_type || payload?.message;
+    if (details) return `${error.message}: ${details}`;
+    return error.message;
+  }
+
   // Get a document by doctype and name
   async getDocument(doctype: string, name: string): Promise<any> {
     try {
@@ -73,35 +122,39 @@ class ERPNextClient {
         `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`
       );
       return response.data.data;
-    } catch (error: any) {
-      throw new Error(`Failed to get ${doctype} ${name}: ${error?.message || 'Unknown error'}`);
+    } catch (error: unknown) {
+      throw new Error(`Failed to get ${doctype} ${name}: ${this.formatError(error)}`);
     }
   }
 
   // Get list of documents for a doctype
-  async getDocList(doctype: string, filters?: Record<string, any>, fields?: string[], limit?: number): Promise<any[]> {
+  async getDocList(doctype: string, options: DocListOptions = {}): Promise<unknown[]> {
     try {
-      let params: Record<string, any> = {};
+      const params: Record<string, string | number> = {};
 
-      if (fields && fields.length) {
-        params['fields'] = JSON.stringify(fields);
+      if (options.fields?.length) {
+        params.fields = JSON.stringify(options.fields);
       }
-
+      const filters = normalizeFilters(options.filters);
       if (filters) {
-        params['filters'] = JSON.stringify(filters);
+        params.filters = JSON.stringify(filters);
       }
-
-      if (limit) {
-        params['limit_page_length'] = limit;
+      const orFilters = normalizeFilters(options.orFilters);
+      if (orFilters) {
+        params.or_filters = JSON.stringify(orFilters);
       }
+      if (options.limit !== undefined) params.limit_page_length = options.limit;
+      if (options.limitStart !== undefined) params.limit_start = options.limitStart;
+      if (options.orderBy) params.order_by = options.orderBy;
+      if (options.expand?.length) params.expand = JSON.stringify(options.expand);
 
       const response = await this.axiosInstance.get(
         `/api/resource/${encodeURIComponent(doctype)}`,
         { params }
       );
       return response.data.data;
-    } catch (error: any) {
-      throw new Error(`Failed to get ${doctype} list: ${error?.message || 'Unknown error'}`);
+    } catch (error: unknown) {
+      throw new Error(`Failed to get ${doctype} list: ${this.formatError(error)}`);
     }
   }
 
@@ -110,11 +163,11 @@ class ERPNextClient {
     try {
       const response = await this.axiosInstance.post(
         `/api/resource/${encodeURIComponent(doctype)}`,
-        { data: doc }
+        doc
       );
       return response.data.data;
-    } catch (error: any) {
-      throw new Error(`Failed to create ${doctype}: ${error?.message || 'Unknown error'}`);
+    } catch (error: unknown) {
+      throw new Error(`Failed to create ${doctype}: ${this.formatError(error)}`);
     }
   }
 
@@ -123,11 +176,39 @@ class ERPNextClient {
     try {
       const response = await this.axiosInstance.put(
         `/api/resource/${encodeURIComponent(doctype)}/${encodeURIComponent(name)}`,
-        { data: doc }
+        doc
       );
       return response.data.data;
-    } catch (error: any) {
-      throw new Error(`Failed to update ${doctype} ${name}: ${error?.message || 'Unknown error'}`);
+    } catch (error: unknown) {
+      throw new Error(`Failed to update ${doctype} ${name}: ${this.formatError(error)}`);
+    }
+  }
+
+  // Get DocType metadata without requiring an existing document.
+  async getDocTypeMeta(doctype: string): Promise<unknown> {
+    const cacheKey = doctype.trim();
+    const cached = doctypeCache.get(cacheKey);
+    if (cached) return cached;
+
+    try {
+      const response = await this.axiosInstance.get(
+        `/api/v2/doctype/${encodeURIComponent(doctype)}/meta`
+      );
+      const metadata = response.data.data ?? response.data.message ?? response.data;
+      doctypeCache.set(cacheKey, metadata);
+      return metadata;
+    } catch (error: unknown) {
+      // Fallback keeps compatibility with older Frappe installations.
+      try {
+        const response = await this.axiosInstance.get(
+          `/api/resource/DocType/${encodeURIComponent(doctype)}`
+        );
+        const metadata = response.data.data;
+        doctypeCache.set(cacheKey, metadata);
+        return metadata;
+      } catch (fallbackError: unknown) {
+        throw new Error(`Failed to get metadata for ${doctype}: ${this.formatError(fallbackError)}`);
+      }
     }
   }
 
@@ -615,7 +696,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       
       try {
-        const documents = await erpnext.getDocList(doctype, filters, fields, limit);
+        const documents = await erpnext.getDocList(doctype, {
+          filters,
+          fields,
+          limit
+        });
         return {
           content: [{
             type: "text",
@@ -935,31 +1020,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
       
       try {
-        // Get a sample document to understand the fields
-        const documents = await erpnext.getDocList(doctype, {}, ["*"], 1);
-        
-        if (!documents || documents.length === 0) {
-          return {
-            content: [{
-              type: "text",
-              text: `No documents found for ${doctype}. Cannot determine fields.`
-            }],
-            isError: true
-          };
-        }
-        
-        // Extract field names from the first document
-        const sampleDoc = documents[0];
-        const fields = Object.keys(sampleDoc).map(field => ({
-          fieldname: field,
-          value: typeof sampleDoc[field],
-          sample: sampleDoc[field]?.toString()?.substring(0, 50) || null
-        }));
-        
+        const metadata = await erpnext.getDocTypeMeta(doctype);
         return {
           content: [{
             type: "text",
-            text: JSON.stringify(fields, null, 2)
+            text: JSON.stringify(metadata, null, 2)
           }]
         };
       } catch (error: any) {
