@@ -97,6 +97,7 @@ class ERPNextClient {
   private axiosInstance: AxiosInstance;
   private authenticated: boolean = false;
   private readonly timeoutMs: number;
+  private readonly allowedMethods: Set<string>;
 
   constructor() {
     // Get ERPNext configuration from environment variables
@@ -115,6 +116,12 @@ class ERPNextClient {
       throw new Error("ERPNEXT_TIMEOUT_MS must be a positive integer");
     }
     this.timeoutMs = configuredTimeout;
+    this.allowedMethods = new Set(
+      (process.env.ERPNEXT_ALLOWED_METHODS || "")
+        .split(",")
+        .map(method => method.trim())
+        .filter(Boolean)
+    );
 
     // Initialize axios instance
     this.axiosInstance = axios.create({
@@ -271,6 +278,12 @@ class ERPNextClient {
   // Call a server-side API method
   async callMethod(method: string, args?: Record<string, any>, httpMethod: "GET" | "POST" = "POST"): Promise<any> {
     try {
+      if (this.allowedMethods.size > 0 && !this.allowedMethods.has(method)) {
+        throw new Error(`Method is not allowed by ERPNEXT_ALLOWED_METHODS: ${method}`);
+      }
+      if (httpMethod !== "GET" && httpMethod !== "POST") {
+        throw new Error(`Unsupported HTTP method: ${httpMethod}`);
+      }
       // Encode each dotted segment so unusual characters don't break the URL.
       const encodedMethod = method.split('.').map(encodeURIComponent).join('.');
       let response;
@@ -744,7 +757,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     "run_report",
     "get_document"
   ]);
-  const destructiveTools = new Set(["cancel_document", "delete_document"]);
+  const destructiveTools = new Set([
+    "call_method",
+    "update_document",
+    "submit_document",
+    "cancel_document",
+    "delete_document"
+  ]);
 
   return {
     tools: tools.map(tool => ({

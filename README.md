@@ -31,6 +31,7 @@ The server requires the following environment variables:
 - `ERPNEXT_API_SECRET` (optional) - API secret for authentication
 - `ERPNEXT_ACCESS_TOKEN` (optional) - OAuth Bearer token; takes precedence over API key/secret
 - `ERPNEXT_TIMEOUT_MS` (optional) - HTTP timeout in milliseconds; defaults to `15000`
+- `ERPNEXT_ALLOWED_METHODS` (optional) - Comma-separated allowlist for `call_method`
 
 Use either `ERPNEXT_ACCESS_TOKEN` or the `ERPNEXT_API_KEY`/`ERPNEXT_API_SECRET`
 pair. Do not commit credentials to the repository.
@@ -131,6 +132,9 @@ The destructive tools (`cancel_document` and `delete_document`) are annotated
 for MCP clients, but authorization must still be enforced by ERPNext. The
 generic `call_method` tool should only be exposed to trusted clients because
 it can invoke any whitelisted Frappe method.
+
+Set `ERPNEXT_ALLOWED_METHODS` in production when `call_method` is enabled, for
+example `frappe.auth.get_logged_user,frappe.client.get_count`.
 
 ### Get Customer Details
 ```
